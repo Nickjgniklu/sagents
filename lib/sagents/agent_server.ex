@@ -249,6 +249,14 @@ defmodule Sagents.AgentServer do
       receive do
         {:status_changed, :idle, nil} -> :ok
       end
+
+  ## Forking
+
+  Because agent configuration is never serialized, a conversation's history can
+  be copied into a new conversation that runs under a different `agent_id` with
+  a different prompt, tool set and middleware stack. `export_state_if_idle/1`
+  reads a snapshot safe to build on, and `Sagents.Fork` turns it into a stored
+  conversation. See `d:forking.md`.
   """
 
   use GenServer
@@ -1443,6 +1451,54 @@ defmodule Sagents.AgentServer do
   end
 
   @doc """
+  Export the conversation state, but only while the agent is idle.
+
+  Same envelope as `export_state/1`, with the status checked inside the server
+  so nothing can start a run between the check and the snapshot.
+
+  A snapshot taken mid-run can end on an assistant message whose `tool_calls`
+  have no matching results yet, because each message joins the rolling state as
+  it is processed rather than when the turn finishes. Any caller that intends to
+  build a new conversation from the payload, rather than to observe the current
+  one, wants a history that has settled on a turn boundary.
+
+  Every status other than `:idle` is refused, and each for its own reason:
+  `:interrupted` is a question the agent still intends to answer, `:cancelled`
+  and `:error` are turns that did not finish, and `:paused` is an infrastructure
+  hold whose task may still be live.
+
+  A pending message is deliberately not included. An idle server has none, since
+  one is only queued while running.
+
+  ## Returns
+
+    * `{:ok, exported}` — string-keyed payload, shaped like `export_state/1`.
+    * `{:error, {:agent_busy, status}}` — the agent is not idle.
+    * `{:error, :not_running}` — no agent is running under that id.
+    * `{:error, :registry_unavailable}` — this node cannot answer whether the
+      agent is running.
+
+  ## Examples
+
+      {:ok, exported} = AgentServer.export_state_if_idle("my-agent-1")
+
+      {:error, {:agent_busy, :running}} = AgentServer.export_state_if_idle("busy-agent")
+
+  See `Sagents.Fork` for the conversation-forking flow built on this.
+  """
+  @spec export_state_if_idle(String.t()) ::
+          {:ok, map()} | {:error, {:agent_busy, status()} | :not_running | :registry_unavailable}
+  def export_state_if_idle(agent_id) when is_binary(agent_id) do
+    case fetch_pid(agent_id) do
+      {:ok, pid} -> GenServer.call(pid, :export_state_if_idle)
+      {:error, :not_running} = error -> error
+      {:error, :registry_unavailable} = error -> error
+    end
+  catch
+    :exit, _reason -> {:error, :not_running}
+  end
+
+  @doc """
   Restore agent state from a previously exported state.
 
   This updates an already-running agent to restore its state from a
@@ -2230,6 +2286,20 @@ defmodule Sagents.AgentServer do
       )
 
     {:reply, serialized, server_state}
+  end
+
+  @impl true
+  def handle_call(:export_state_if_idle, _from, %ServerState{status: :idle} = server_state) do
+    # No `pending_message:` opt: an idle server has none, and omitting it keeps
+    # the key out of a payload destined to seed a different conversation.
+    serialized = StateSerializer.serialize_server_state(nil, server_state.state)
+
+    {:reply, {:ok, serialized}, server_state}
+  end
+
+  @impl true
+  def handle_call(:export_state_if_idle, _from, server_state) do
+    {:reply, {:error, {:agent_busy, server_state.status}}, server_state}
   end
 
   @impl true
