@@ -1,5 +1,130 @@
 # Changelog
 
+## v0.15.0
+
+One process subscribed to two agents could not tell their events apart. Every
+main-channel event was `{:agent, event}`, and the fan-out is a direct `send/2`,
+so there was no sender, no topic, and no payload field to recover identity from.
+Two agents streaming into one mailbox interleaved with nothing to separate them.
+
+A subscription can now carry a **tag**, and every event delivered on it names
+its source:
+
+```elixir
+# Unchanged. Still {:agent, event}.
+Subscriber.subscribe_to_agent(subs, agent_id)
+
+# Library-supplied identity: {:agent, agent_id, event}
+Subscriber.subscribe_to_agent(subs, agent_id, tagged: true)
+
+# Host-supplied routing key: {:agent, card_id, event}
+Subscriber.subscribe_to_agent(subs, agent_id, tag: card_id)
+```
+
+The tag lives in the subscription rather than in the agent, so two hosts watching
+the same agent can address it differently, and a host can use a key it already
+has, a card id or a `{:note, id}` tuple, instead of keeping an
+`agent_id => element` map purely to undo the library's choice.
+
+| Channel | Untagged | Tagged |
+| --- | --- | --- |
+| `:main` | `{:agent, event}` | `{:agent, tag, event}` |
+| `:debug` | `{:agent, {:debug, event}}` | `{:agent, tag, {:debug, event}}` |
+| filesystem | `{:file_system, change_info}` | `{:file_system, tag, change_info}` |
+
+`nil` is a legal tag: the option is read as "was `:tag` given", not "is the value
+truthy". The shape covers every delivery on a subscription: live broadcasts, the
+status snapshot sent at subscribe time, events broadcast during the agent's boot
+when the subscription was seeded through `:initial_subscribers`, and the
+re-subscription that follows a producer crash. A subscription that starts
+`:pending` because its agent is not running yet comes back carrying its tag.
+
+**Nothing here breaks your application.** A subscription that asks for no tag
+receives byte-identical messages to v0.14.0 on every channel. Upgrade the
+dependency, change no host code, and your app compiles clean and behaves exactly
+as before.
+
+### Adding a tag is a breaking change *within your own app*
+
+`Phoenix.LiveView.Channel` calls `view.handle_info/2` whenever the view exports
+it at all. So a host with no catch-all raises `FunctionClauseError` on the first
+event of an unexpected shape and crashes loudly, while a host **with** a
+catch-all silently swallows every event: the app stays up, the agents run, the
+state persists, and the UI never updates, with nothing in the logs.
+
+The more defensively written host is the one that gets the silent failure.
+Anyone adding a tag to an existing subscription must update that subscription's
+`handle_info` clauses in the same change.
+
+The trap has a second edge. Every path that subscribes to a given agent must
+agree on the tag: a publisher keeps one entry per `{channel, pid}`, so whichever
+path subscribes last decides the envelope. A load path that tags and an action
+path that does not gives a conversation whose event shape changes the first time
+the user does something. In a generated app that means `AgentLiveHelpers` and the
+`Coordinator`'s `Sagents.Session` calls, which the v0.15.0 templates keep in step
+through a single `@subscribe_opts` attribute.
+
+### Which subscription an event concerns
+
+Two consumer-side helpers already computed the answer and discarded it. They now
+report it on request:
+
+```elixir
+{:matched, sub_key, new_subs} =
+  Subscriber.handle_publisher_down(subs, ref, reason, report: true)
+
+{new_subs, revived_keys} =
+  Subscriber.handle_presence_diff(subs, topic, payload, report: true)
+```
+
+`report: true` is opt-in for the same reason the tag is. Without it both return
+exactly what they returned in v0.14.0, namely `{:matched, new_subs} | :no_match`
+and a bare subs map, so an existing host keeps working untouched. That includes
+a generated `AgentSubscriberSession` that a dependency bump never touches.
+
+`subs` is now guarded as a map on every clause of `handle_presence_diff/4`,
+including the one that ignores the payload. Feeding the reporting tuple back in
+on the next diff is the mistake that guard catches, and Elixir 1.19's type checker
+rejects it at compile time rather than letting it surface as a `BadMapError`
+raised two events later from inside the library.
+
+### The generator emits the tagged shape
+
+`mix sagents.setup` now produces a host that is tagged from the start: events
+arrive as `{:agent, agent_id, event}` and the emitted `handle_info` examples
+match. That costs a single-conversation socket one wildcard per clause and means
+a host that later opens a second panel adds a subscription rather than reworking
+every clause it already wrote.
+
+Your generated files are copies. A dependency bump does not update them, so
+existing apps stay on the bare envelope until they choose otherwise.
+
+### Producer-side signature changes
+
+Only reached by a host that implemented its own producer on
+`use Sagents.Publisher`, and only if it wants tags. All three take defaults, so
+existing calls are unaffected:
+
+```elixir
+Sagents.Publisher.State.add/3      → add/4       # trailing tag, defaults :untagged
+Sagents.Publisher.State.seed/2     → seed/3      # trailing default_identity
+Sagents.Publisher.subscribe/3      → subscribe/4 # trailing tag
+Sagents.Publisher.broadcast/3      → broadcast/4 # trailing per-subscriber envelope fun
+```
+
+`Sagents.Publisher.State.resolve_tag/2` is the single interpreter of `:tag` and
+`:tagged`; `tag_to_opts/1` is its inverse, which is how a revived subscription
+round-trips its tag back through the public subscribe path.
+
+### Upgrading from v0.14.x to v0.15.0
+
+Read
+[MIGRATION_PROMPT_v0.14.x_TO_v0.15.0.md](https://github.com/sagents-ai/sagents/blob/main/MIGRATION_PROMPT_v0.14.x_TO_v0.15.0.md).
+It is written to be handed to a coding agent.
+
+Nothing in it is required. Every step is opt-in work to adopt the tagged shape,
+and an app that does none of it keeps working.
+
 ## v0.14.0
 
 A subscriber process that switches between conversations now hands back the

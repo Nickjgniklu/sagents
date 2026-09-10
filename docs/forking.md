@@ -229,6 +229,26 @@ parent read. The consequence is that writes by any fork are visible to the paren
 and to every sibling. That is right for a read-only corpus and wrong if forks
 edit.
 
+The choice also decides how many filesystem subscriptions a host showing several
+forks needs. A fork on the default `{:agent, agent_id}` scope has its own
+`Sagents.FileSystemServer`, so a page rendering file activity for three forks
+holds three subscriptions in one mailbox and needs `tagged: true` (or its own
+`tag:`) on each to tell `{:file_system, change_info}` messages apart. A shared
+`:filesystem_scope` is one subscription and needs no tag.
+
+## Subscribing to a fork
+
+Opening a fork is the likeliest path in the system to a `:pending` subscription.
+A fork is a stored row with no running process: nothing started an agent for it,
+so `Sagents.Subscriber.subscribe_to_agent/3` records the subscription as
+`:pending` and the next presence arrival revives it.
+
+Tags survive that window. The tag is stored in the subscription entry rather
+than only in the producer, so a subscription that goes out `:pending` and comes
+back on a presence join returns carrying the tag it was created with, and the
+panel that asked for `{:agent, {:fork, fork_id}, event}` keeps receiving that
+shape rather than silently falling back to the bare envelope.
+
 ## Cache breakpoints
 
 `cache_control: true` lives in `LangChain.Message.ContentPart` options and
