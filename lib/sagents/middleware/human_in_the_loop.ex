@@ -379,7 +379,7 @@ defmodule Sagents.Middleware.HumanInTheLoop do
         Enum.map(all_calls, fn call ->
           call = Map.get(effective_calls, call.call_id, call)
 
-          {message, exception} =
+          error =
             case Map.get(decisions_by_id, call.call_id) do
               %{type: :reject} ->
                 {"Tool call rejected by the human reviewer. Do not retry without a new user request.",
@@ -394,29 +394,7 @@ defmodule Sagents.Middleware.HumanInTheLoop do
                 )
             end
 
-          Callbacks.fire(chain.callbacks, :on_tool_execution_failed, [chain, call, message])
-
-          case exception do
-            {error, stacktrace} ->
-              Callbacks.fire(chain.callbacks, :on_tool_execution_exception, [
-                chain,
-                call,
-                error,
-                stacktrace
-              ])
-
-            nil ->
-              :ok
-          end
-
-          ToolResult.new!(%{
-            tool_call_id: call.call_id,
-            name: call.name,
-            content: message,
-            is_error: true,
-            is_exception: not is_nil(exception),
-            exception: exception
-          })
+          pre_approval_error_result(chain, call, error)
         end)
 
       message = Message.new_tool_result!(%{tool_results: results})
@@ -430,6 +408,32 @@ defmodule Sagents.Middleware.HumanInTheLoop do
       Callbacks.fire(chain.callbacks, :on_message_processed, [updated_chain, message])
       {:error, updated_chain}
     end
+  end
+
+  defp pre_approval_error_result(chain, call, {message, exception}) do
+    Callbacks.fire(chain.callbacks, :on_tool_execution_failed, [chain, call, message])
+
+    case exception do
+      {error, stacktrace} ->
+        Callbacks.fire(chain.callbacks, :on_tool_execution_exception, [
+          chain,
+          call,
+          error,
+          stacktrace
+        ])
+
+      nil ->
+        :ok
+    end
+
+    ToolResult.new!(%{
+      tool_call_id: call.call_id,
+      name: call.name,
+      content: message,
+      is_error: true,
+      is_exception: not is_nil(exception),
+      exception: exception
+    })
   end
 
   defp run_pre_approval(nil, _arguments, _context), do: :ok
