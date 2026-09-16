@@ -60,6 +60,162 @@ defmodule Sagents.Mode.StepsTest do
   # ── check_pre_tool_hitl/2 ──────────────────────────────────────
 
   describe "check_pre_tool_hitl/2" do
+    test "rejects invalid arguments before requesting human approval" do
+      test_pid = self()
+
+      tool =
+        LangChain.Function.new!(%{
+          name: "write_file",
+          parse_args: fn _args -> {:error, "Invalid path. Choose another path."} end,
+          function: fn _args, _context ->
+            send(test_pid, :write_executed)
+            {:ok, "written"}
+          end
+        })
+
+      assistant = assistant_with_tool_call("write_file")
+
+      chain =
+        chain_with_context([assistant], %{state: State.new!(%{agent_id: "preflight-test"})})
+        |> Map.put(:last_message, assistant)
+        |> Map.put(:needs_response, true)
+        |> LLMChain.add_tools([tool])
+
+      assert {:continue, rejected_chain} =
+               Steps.check_pre_tool_hitl({:continue, chain},
+                 middleware: [
+                   hitl_middleware(%{
+                     "write_file" => %{
+                       pre_approval: fn args, _context -> tool.parse_args.(args) end
+                     }
+                   })
+                 ]
+               )
+
+      assert %Message{
+               role: :tool,
+               tool_results: [
+                 %ToolResult{
+                   name: "write_file",
+                   tool_call_id: "call_1",
+                   is_error: true,
+                   is_interrupt: false
+                 } = result
+               ]
+             } = rejected_chain.last_message
+
+      assert LangChain.Message.ContentPart.content_to_string(result.content) =~ "Invalid path"
+      refute_received :write_executed
+    end
+
+    test "valid checks still require approval and callbacks are not in the payload" do
+      test_pid = self()
+      assistant = assistant_with_tool_call("write_file")
+
+      chain =
+        chain_with_context([assistant], %{
+          state: State.new!(%{agent_id: "preflight"}),
+          tenant: "tenant-1"
+        })
+
+      hitl =
+        hitl_middleware(%{
+          "write_file" => %{
+            pre_approval: fn args, context ->
+              send(test_pid, {:checked, args, context})
+              {:ok, %{parsed: true}}
+            end
+          }
+        })
+
+      assert {:interrupt, ^chain, data} =
+               Steps.check_pre_tool_hitl({:continue, chain}, middleware: [hitl])
+
+      assert_received {:checked, %{}, %{tenant: "tenant-1", tool_call_id: "call_1"}}
+      assert data.review_configs["write_file"] == %{allowed_decisions: [:approve, :edit, :reject]}
+      assert is_binary(Jason.encode!(data))
+      assert [%{arguments: %{}}] = data.action_requests
+    end
+
+    test "a rejected call postpones every sibling in order, including calls to the same tool" do
+      test_pid = self()
+      first = hd(assistant_with_tool_call("write_file", "bad").tool_calls)
+      second = hd(assistant_with_tool_call("write_file", "good").tool_calls)
+      third = hd(assistant_with_tool_call("read_file", "read").tool_calls)
+      assistant = Message.new_assistant!(%{tool_calls: [first, second, third]})
+      chain = chain_with_context([assistant], %{state: State.new!(%{agent_id: "preflight"})})
+
+      chain =
+        LLMChain.add_callback(chain, %{
+          on_tool_response_created: fn _chain, message -> send(test_pid, {:results, message}) end,
+          on_message_processed: fn _chain, message -> send(test_pid, {:processed, message}) end,
+          on_tool_execution_failed: fn _chain, call, _message ->
+            send(test_pid, {:failed, call.call_id})
+          end
+        })
+
+      hitl =
+        hitl_middleware(%{
+          "write_file" => %{
+            pre_approval: fn _args, context ->
+              if context.tool_call_id == "bad", do: {:error, "Invalid selection"}, else: :ok
+            end
+          }
+        })
+
+      assert {:continue, rejected} =
+               Steps.check_pre_tool_hitl({:continue, chain}, middleware: [hitl])
+
+      assert ["bad", "good", "read"] ==
+               Enum.map(rejected.last_message.tool_results, & &1.tool_call_id)
+
+      assert Enum.all?(rejected.last_message.tool_results, &(&1.is_error and not &1.is_interrupt))
+      assert rejected.needs_response
+      assert_received {:results, message}
+      assert message == rejected.last_message
+      assert_received {:processed, ^message}
+      for call_id <- ["bad", "good", "read"], do: assert_received({:failed, ^call_id})
+
+      assert {:continue, ^rejected} =
+               Steps.check_pre_tool_hitl({:continue, rejected}, middleware: [hitl])
+    end
+
+    test "pre-approval checks fail closed for exceptions and unexpected return values" do
+      assistant = assistant_with_tool_call("write_file")
+      chain = chain_with_context([assistant], %{state: State.new!(%{agent_id: "preflight"})})
+
+      for callback <- [
+            fn _arguments, _context -> raise "private details" end,
+            fn _arguments, _context -> false end,
+            fn _arguments, _context -> {:error, [:invalid]} end
+          ] do
+        hitl = hitl_middleware(%{"write_file" => %{pre_approval: callback}})
+
+        assert {:continue, rejected} =
+                 Steps.check_pre_tool_hitl({:continue, chain}, middleware: [hitl])
+
+        assert [%ToolResult{is_error: true} = result] = rejected.last_message.tool_results
+
+        refute LangChain.Message.ContentPart.content_to_string(result.content) =~
+                 "private details"
+      end
+    end
+
+    test "checks are not called for tools that do not require approval" do
+      hitl =
+        hitl_middleware(%{
+          "write_file" => %{
+            allowed_decisions: [],
+            pre_approval: fn _arguments, _context -> flunk("unexpected pre-approval check") end
+          }
+        })
+
+      chain = chain_with_context([assistant_with_tool_call("write_file")])
+
+      assert {:continue, ^chain} =
+               Steps.check_pre_tool_hitl({:continue, chain}, middleware: [hitl])
+    end
+
     test "continues when no middleware is configured" do
       chain = chain_with_context()
       result = Steps.check_pre_tool_hitl({:continue, chain}, [])

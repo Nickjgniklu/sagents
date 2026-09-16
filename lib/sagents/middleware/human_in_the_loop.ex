@@ -34,6 +34,45 @@ defmodule Sagents.Middleware.HumanInTheLoop do
   - `:edit` - Execute the tool with modified arguments
   - `:reject` - Skip tool execution entirely
 
+  ### Pre-approval validation
+
+  A tool can opt into a read-only check before its approval request is shown:
+
+      interrupt_on = %{
+        "write_file" => %{
+          allowed_decisions: [:approve, :edit, :reject],
+          pre_approval: fn arguments, context ->
+            MyApp.Files.validate_write(arguments, context)
+          end
+        }
+      }
+
+  The arity-2 callback receives the original tool arguments and the same trusted
+  custom context used for execution, including `:tool_call_id`. Return `:ok` or
+  `{:ok, map}` to continue to human approval, or `{:error, message}` to send
+  corrective feedback to the model without an approval interrupt. Success never
+  auto-approves a tool. Exceptions and unsupported return values fail closed.
+
+  To reuse a `LangChain.Function` parser, configure
+  `pre_approval: fn args, _context -> tool.parse_args.(args) end`. Any parsed map
+  is used only to indicate successful validation; it does not replace the raw
+  arguments shown to the reviewer. Normal execution-time parsing still runs.
+
+  Checks run again on resume for approved or edited calls, using the edited
+  arguments when applicable. Human-rejected calls are not checked or executed.
+  Callbacks must be read-only and safe to repeat. Keep authorization and other
+  execution-time checks in the tool: approval is not a substitute for them.
+
+  If any check fails, the entire pending batch is returned as error tool results
+  in call order, without executing any tool. The rejected calls get their check's
+  feedback; valid or unchecked siblings get an explicit not-executed/retry
+  message. A human denial retains do-not-retry feedback. This avoids partially
+  executing a batch or treating a failed check as automatic approval.
+
+  The callback is not included in `review_configs` or other interrupt payloads.
+  Rebuild the agent with its trusted callback configuration when restoring a
+  persisted interrupt. Existing tools without `pre_approval` are unchanged.
+
   ## Usage
 
       # Create agent with HITL middleware
@@ -191,10 +230,15 @@ defmodule Sagents.Middleware.HumanInTheLoop do
   alias Sagents.AgentServer
   alias LangChain.Message
   alias LangChain.Message.ToolCall
+  alias LangChain.Message.ToolResult
+  alias LangChain.Callbacks
   alias LangChain.Chains.LLMChain
 
+  @type pre_approval :: (map(), map() | nil -> :ok | {:ok, map()} | {:error, String.t()})
+
   @type interrupt_config :: %{
-          allowed_decisions: [atom()]
+          required(:allowed_decisions) => [atom()],
+          optional(:pre_approval) => pre_approval()
         }
 
   @type interrupt_on_config :: %{
@@ -287,6 +331,94 @@ defmodule Sagents.Middleware.HumanInTheLoop do
       do: true
 
   def restorable_interrupt?(_other), do: false
+
+  @doc """
+  Run configured, read-only pre-approval checks for pending tool calls.
+
+  Each callback receives the raw arguments and trusted tool execution context,
+  including `:tool_call_id`. It returns `:ok`, `{:ok, parsed_arguments}`, or
+  `{:error, message}`. Parsed arguments are not persisted or substituted: tools
+  still parse their original arguments at execution time.
+
+  If any check fails, no call in the batch executes or requests approval. Each
+  call receives an error result, with unchecked or valid siblings instructed to
+  retry. This preserves call/result pairing without partially executing a batch.
+  """
+  @spec check_pre_approval(LLMChain.t(), map()) :: {:ok, LLMChain.t()} | {:error, LLMChain.t()}
+  def check_pre_approval(chain, config) do
+    case List.last(chain.exchanged_messages) do
+      %Message{role: :assistant, tool_calls: [_call | _calls] = calls} ->
+        check_pre_approval(chain, calls, calls, config)
+
+      _other ->
+        {:ok, chain}
+    end
+  end
+
+  defp check_pre_approval(chain, checked_calls, all_calls, config, decisions_by_id \\ %{}) do
+    errors =
+      checked_calls
+      |> collect_interrupt_requests(config.interrupt_on)
+      |> Enum.reduce(%{}, fn call, errors ->
+        tool_config = Map.fetch!(config.interrupt_on, call.name)
+        context = Map.put(chain.custom_context || %{}, :tool_call_id, call.call_id)
+
+        case run_pre_approval(tool_config[:pre_approval], call.arguments || %{}, context) do
+          :ok -> errors
+          {:error, message} -> Map.put(errors, call.call_id, message)
+        end
+      end)
+
+    if map_size(errors) == 0 do
+      {:ok, chain}
+    else
+      results =
+        Enum.map(all_calls, fn call ->
+          message =
+            case Map.get(decisions_by_id, call.call_id) do
+              %{type: :reject} ->
+                "Tool call rejected by the human reviewer. Do not retry without a new user request."
+
+              _other ->
+                Map.get(
+                  errors,
+                  call.call_id,
+                  "Tool call not executed because another call failed pre-approval validation. " <>
+                    "Correct the invalid call and retry this call if it is still needed."
+                )
+            end
+
+          Callbacks.fire(chain.callbacks, :on_tool_execution_failed, [chain, call, message])
+
+          ToolResult.new!(%{
+            tool_call_id: call.call_id,
+            name: call.name,
+            content: message,
+            is_error: true
+          })
+        end)
+
+      message = Message.new_tool_result!(%{tool_results: results})
+      updated_chain = LLMChain.add_message(chain, message)
+      Callbacks.fire(chain.callbacks, :on_tool_response_created, [updated_chain, message])
+      Callbacks.fire(chain.callbacks, :on_message_processed, [updated_chain, message])
+      {:error, updated_chain}
+    end
+  end
+
+  defp run_pre_approval(nil, _arguments, _context), do: :ok
+
+  defp run_pre_approval(callback, arguments, context) do
+    case callback.(arguments, context) do
+      :ok -> :ok
+      {:ok, %{} = _parsed} -> :ok
+      {:error, message} when is_binary(message) -> {:error, message}
+      {:error, reason} -> {:error, inspect(reason)}
+      _other -> {:error, "Invalid pre_approval response. The tool call was not executed."}
+    end
+  rescue
+    _exception -> {:error, "Pre-approval validation failed. The tool call was not executed."}
+  end
 
   @doc """
   Check if the current state requires an interrupt for human approval.
@@ -402,7 +534,7 @@ defmodule Sagents.Middleware.HumanInTheLoop do
       when is_list(decisions) do
     case process_decisions(state, decisions, config) do
       {:ok, ^state} ->
-        execute_approved_tools(agent, state, decisions, opts)
+        execute_approved_tools(agent, state, decisions, config, opts)
 
       {:error, reason} ->
         {:error, reason}
@@ -411,14 +543,14 @@ defmodule Sagents.Middleware.HumanInTheLoop do
 
   def handle_resume(_agent, state, _resume_data, _config, _opts), do: {:cont, state}
 
-  defp execute_approved_tools(agent, state, decisions, opts) do
+  defp execute_approved_tools(agent, state, decisions, config, opts) do
     messages = state.messages
     callbacks = Keyword.get(opts, :callbacks)
 
     if Enum.all?(messages, &is_struct(&1, Message)) do
       with {:ok, chain} <- Agent.build_chain(agent, messages, state, callbacks),
            %{tool_calls: all_tool_calls} <- find_assistant_with_tool_calls(messages) do
-        run_decisions(chain, all_tool_calls, decisions, state)
+        run_decisions(chain, all_tool_calls, decisions, state, config)
       else
         nil -> {:error, "No tool calls found in state"}
         {:error, reason} -> {:error, reason}
@@ -436,11 +568,31 @@ defmodule Sagents.Middleware.HumanInTheLoop do
     end)
   end
 
-  defp run_decisions(chain, all_tool_calls, decisions, state) do
+  defp run_decisions(chain, all_tool_calls, decisions, state, config) do
     full_decisions = build_full_decisions(all_tool_calls, decisions, state.interrupt_data)
 
+    checked_calls =
+      all_tool_calls
+      |> Enum.zip(full_decisions)
+      |> Enum.flat_map(fn
+        {_call, %{type: :reject}} -> []
+        {call, %{type: :edit, arguments: arguments}} -> [%{call | arguments: arguments}]
+        {call, _decision} -> [call]
+      end)
+
+    decisions_by_id =
+      all_tool_calls
+      |> Enum.zip(full_decisions)
+      |> Map.new(fn {call, decision} -> {call.call_id, decision} end)
+
     updated_chain =
-      LLMChain.execute_tool_calls_with_decisions(chain, all_tool_calls, full_decisions)
+      case check_pre_approval(chain, checked_calls, all_tool_calls, config, decisions_by_id) do
+        {:ok, chain} ->
+          LLMChain.execute_tool_calls_with_decisions(chain, all_tool_calls, full_decisions)
+
+        {:error, rejected_chain} ->
+          rejected_chain
+      end
 
     tool_result_message = List.last(updated_chain.exchanged_messages)
     state_with_results = State.add_message(state, tool_result_message)
@@ -551,7 +703,8 @@ defmodule Sagents.Middleware.HumanInTheLoop do
     review_configs =
       tool_calls
       |> Enum.map(fn %ToolCall{name: tool_name} ->
-        {tool_name, Map.get(interrupt_on, tool_name, %{allowed_decisions: @default_decisions})}
+        config = Map.get(interrupt_on, tool_name, %{allowed_decisions: @default_decisions})
+        {tool_name, Map.delete(config, :pre_approval)}
       end)
       |> Enum.uniq_by(fn {tool_name, _config} -> tool_name end)
       |> Map.new()

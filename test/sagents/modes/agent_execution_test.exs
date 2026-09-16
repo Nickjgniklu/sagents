@@ -105,6 +105,188 @@ defmodule Sagents.Modes.AgentExecutionTest do
     Message.new_assistant!(%{content: content})
   end
 
+  defp pre_approval_agent(check) do
+    test_pid = self()
+
+    tool = %{
+      submit_tool()
+      | function: fn args, _context ->
+          send(test_pid, {:submitted, args})
+          {:ok, "submitted"}
+        end
+    }
+
+    {:ok, agent} =
+      Sagents.Agent.new(
+        %{
+          model: mock_model(),
+          tools: [tool],
+          tool_context: %{tenant: "tenant-1"},
+          middleware: [
+            {HumanInTheLoop,
+             interrupt_on: %{
+               "submit_report" => %{pre_approval: check}
+             }}
+          ]
+        },
+        replace_default_middleware: true
+      )
+
+    agent
+  end
+
+  describe "pre-approval validation" do
+    test "invalid calls return to the model, corrected calls pause, and approved calls execute once" do
+      test_pid = self()
+
+      agent =
+        pre_approval_agent(fn args, context ->
+          send(test_pid, {:checked, context.tenant, context.tool_call_id})
+          if args["title"] == "good", do: :ok, else: {:error, "Use a valid title"}
+        end)
+
+      ChatAnthropic
+      |> expect(:call, fn _model, _messages, _tools ->
+        {:ok, [assistant_with_tool_call("submit_report", %{"title" => "bad"}, "invalid")]}
+      end)
+      |> expect(:call, fn _model, messages, _tools ->
+        assert %Message{
+                 role: :tool,
+                 tool_results: [%ToolResult{tool_call_id: "invalid", is_error: true}]
+               } = List.last(messages)
+
+        {:ok, [assistant_with_tool_call("submit_report", %{"title" => "good"}, "valid")]}
+      end)
+
+      state = Sagents.State.new!(%{messages: [Message.new_user!("Submit the report")]})
+      assert {:interrupt, paused, data} = Sagents.Agent.execute(agent, state)
+      assert [%{tool_call_id: "valid"}] = data.action_requests
+      assert_received {:checked, "tenant-1", "invalid"}
+      assert_received {:checked, "tenant-1", "valid"}
+      refute_received {:submitted, _}
+
+      stub(ChatAnthropic, :call, fn _model, _messages, _tools ->
+        {:ok, [plain_assistant_message("Done")]}
+      end)
+
+      assert {:ok, _resumed} = Sagents.Agent.resume(agent, paused, [%{type: :approve}])
+      assert_received {:checked, "tenant-1", "valid"}
+      assert_received {:submitted, %{"title" => "good"}}
+      refute_received {:submitted, _}
+    end
+
+    test "a selection that becomes invalid while waiting is rejected on resume" do
+      validity = :atomics.new(1, [])
+
+      agent =
+        pre_approval_agent(fn _args, _context ->
+          if :atomics.get(validity, 1) == 0,
+            do: :ok,
+            else: {:error, "Selection changed; prepare again"}
+        end)
+
+      expect(ChatAnthropic, :call, fn _model, _messages, _tools ->
+        {:ok, [assistant_with_tool_call("submit_report", %{"title" => "good"})]}
+      end)
+
+      state = Sagents.State.new!(%{messages: [Message.new_user!("Submit the report")]})
+      assert {:interrupt, paused, _data} = Sagents.Agent.execute(agent, state)
+      :atomics.put(validity, 1, 1)
+
+      assert {:ok, resumed} =
+               HumanInTheLoop.handle_resume(
+                 agent,
+                 paused,
+                 [%{type: :approve}],
+                 hd(agent.middleware).config,
+                 []
+               )
+
+      assert [%ToolResult{is_error: true} = result] = List.last(resumed.messages).tool_results
+
+      assert LangChain.Message.ContentPart.content_to_string(result.content) =~
+               "Selection changed"
+
+      refute_received {:submitted, _}
+    end
+
+    test "edited arguments are checked before execution" do
+      agent =
+        pre_approval_agent(fn args, _context ->
+          if args["title"] == "good", do: :ok, else: {:error, "Invalid edited title"}
+        end)
+
+      expect(ChatAnthropic, :call, fn _model, _messages, _tools ->
+        {:ok, [assistant_with_tool_call("submit_report", %{"title" => "good"})]}
+      end)
+
+      state = Sagents.State.new!(%{messages: [Message.new_user!("Submit the report")]})
+      assert {:interrupt, paused, _data} = Sagents.Agent.execute(agent, state)
+      decisions = [%{type: :edit, arguments: %{"title" => "bad"}}]
+
+      assert {:ok, resumed} =
+               HumanInTheLoop.handle_resume(
+                 agent,
+                 paused,
+                 decisions,
+                 hd(agent.middleware).config,
+                 []
+               )
+
+      assert [%ToolResult{is_error: true} = result] = List.last(resumed.messages).tool_results
+
+      assert LangChain.Message.ContentPart.content_to_string(result.content) =~
+               "Invalid edited title"
+
+      refute_received {:submitted, _}
+    end
+
+    test "a human denial is not rechecked or turned into retry feedback when a sibling becomes stale" do
+      validity = :atomics.new(1, [])
+
+      agent =
+        pre_approval_agent(fn _args, context ->
+          if :atomics.get(validity, 1) == 0 do
+            :ok
+          else
+            assert context.tool_call_id == "stale"
+            {:error, "Stale selection"}
+          end
+        end)
+
+      expect(ChatAnthropic, :call, fn _model, _messages, _tools ->
+        calls =
+          for call_id <- ["denied", "stale"] do
+            hd(
+              assistant_with_tool_call("submit_report", %{"title" => "good"}, call_id).tool_calls
+            )
+          end
+
+        {:ok, [Message.new_assistant!(%{tool_calls: calls})]}
+      end)
+
+      state = Sagents.State.new!(%{messages: [Message.new_user!("Submit the reports")]})
+      assert {:interrupt, paused, _data} = Sagents.Agent.execute(agent, state)
+      :atomics.put(validity, 1, 1)
+      decisions = [%{type: :reject}, %{type: :approve}]
+
+      assert {:ok, resumed} =
+               HumanInTheLoop.handle_resume(
+                 agent,
+                 paused,
+                 decisions,
+                 hd(agent.middleware).config,
+                 []
+               )
+
+      assert [denied, stale] = List.last(resumed.messages).tool_results
+      assert denied.tool_call_id == "denied"
+      assert LangChain.Message.ContentPart.content_to_string(denied.content) =~ "Do not retry"
+      assert LangChain.Message.ContentPart.content_to_string(stale.content) =~ "Stale selection"
+      refute_received {:submitted, _}
+    end
+  end
+
   # ── Test: Standard execution (no until_tool) ─────────────────────
 
   describe "standard execution (no until_tool)" do

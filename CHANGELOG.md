@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Optional per-tool `pre_approval` callbacks in `HumanInTheLoop` configuration.
+  Read-only checks can reject invalid requests with model-facing tool feedback
+  before any approval prompt. Successful checks still require approval and run
+  again for approved or edited calls on resume. A failed check defers the entire
+  pending tool batch without executing side effects. Callback functions are not
+  included in persisted approval payloads; existing approval behavior remains
+  unchanged when the option is omitted.
+
 ## v0.14.1
 
 A newly started agent is now reachable by every caller by the time

@@ -34,29 +34,36 @@ defmodule Sagents.Mode.Steps do
         {:continue, chain}
 
       %MiddlewareEntry{module: module, config: config} ->
-        agent_id =
-          case chain.custom_context do
-            %{state: %{agent_id: agent_id}} -> agent_id
-            _other -> nil
-          end
-
-        state = %State{
-          agent_id: agent_id,
-          messages: chain.exchanged_messages,
-          metadata: %{}
-        }
-
-        case module.check_for_interrupt(state, config) do
-          {:interrupt, interrupt_data} ->
-            {:interrupt, chain, interrupt_data}
-
-          :continue ->
-            {:continue, chain}
+        case module.check_pre_approval(chain, config) do
+          {:ok, chain} -> check_hitl_interrupt(chain, module, config)
+          {:error, chain} -> {:continue, chain}
         end
     end
   end
 
   def check_pre_tool_hitl(terminal, _opts), do: terminal
+
+  defp check_hitl_interrupt(chain, module, config) do
+    agent_id =
+      case chain.custom_context do
+        %{state: %{agent_id: agent_id}} -> agent_id
+        _other -> nil
+      end
+
+    state = %State{
+      agent_id: agent_id,
+      messages: chain.exchanged_messages,
+      metadata: %{}
+    }
+
+    case module.check_for_interrupt(state, config) do
+      {:interrupt, interrupt_data} ->
+        {:interrupt, chain, interrupt_data}
+
+      :continue ->
+        {:continue, chain}
+    end
+  end
 
   @doc """
   Propagate state updates from tool results into the chain's custom_context.
