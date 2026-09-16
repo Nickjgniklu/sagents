@@ -11,6 +11,10 @@
   pending tool batch without executing side effects. Callback functions are not
   included in persisted approval payloads; existing approval behavior remains
   unchanged when the option is omitted.
+  Failed batches count toward the normal retry budget. Rescued callback exceptions
+  retain native diagnostics and emit exception notifications while model-facing
+  feedback stays sanitized. Failure notifications report effective edited arguments
+  when validation rejects an edited call.
 
 ## v0.14.1
 

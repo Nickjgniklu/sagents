@@ -180,6 +180,59 @@ defmodule Sagents.Mode.StepsTest do
                Steps.check_pre_tool_hitl({:continue, rejected}, middleware: [hitl])
     end
 
+    test "callback exceptions retain native diagnostics without exposing them to the model" do
+      test_pid = self()
+      raised_call = hd(assistant_with_tool_call("write_file", "raised").tool_calls)
+      rejected_call = hd(assistant_with_tool_call("write_file", "rejected").tool_calls)
+      deferred_call = hd(assistant_with_tool_call("read_file", "deferred").tool_calls)
+
+      assistant =
+        Message.new_assistant!(%{tool_calls: [raised_call, rejected_call, deferred_call]})
+
+      chain =
+        chain_with_context([assistant])
+        |> LLMChain.add_callback(%{
+          on_tool_execution_exception: fn _chain, call, exception, stacktrace ->
+            send(test_pid, {:exception, call.call_id, exception, stacktrace})
+          end,
+          on_tool_execution_failed: fn _chain, call, message ->
+            send(test_pid, {:failed, call.call_id, message})
+          end
+        })
+
+      hitl =
+        hitl_middleware(%{
+          "write_file" => %{
+            pre_approval: fn _args, context ->
+              if context.tool_call_id == "raised",
+                do: raise("private diagnostics"),
+                else: {:error, "Invalid input"}
+            end
+          }
+        })
+
+      assert {:continue, rejected} =
+               Steps.check_pre_tool_hitl({:continue, chain}, middleware: [hitl])
+
+      assert [
+               %ToolResult{
+                 tool_call_id: "raised",
+                 is_exception: true,
+                 exception: {%RuntimeError{} = error, stacktrace}
+               } = result,
+               %ToolResult{tool_call_id: "rejected", is_exception: false, exception: nil},
+               %ToolResult{tool_call_id: "deferred", is_exception: false, exception: nil}
+             ] = rejected.last_message.tool_results
+
+      assert error.message == "private diagnostics"
+      assert [_frame | _frames] = stacktrace
+      assert_received {:exception, "raised", ^error, ^stacktrace}
+      refute_received {:exception, _call_id, _error, _stacktrace}
+      assert_received {:failed, "raised", message}
+      assert LangChain.Message.ContentPart.content_to_string(result.content) == message
+      refute message =~ "private diagnostics"
+    end
+
     test "pre-approval checks fail closed for exceptions and unexpected return values" do
       assistant = assistant_with_tool_call("write_file")
       chain = chain_with_context([assistant], %{state: State.new!(%{agent_id: "preflight"})})

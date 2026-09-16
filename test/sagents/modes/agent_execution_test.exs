@@ -136,6 +136,38 @@ defmodule Sagents.Modes.AgentExecutionTest do
   end
 
   describe "pre-approval validation" do
+    test "rejected batches respect the tool failure retry budget" do
+      test_pid = self()
+
+      chain = %{
+        build_chain([submit_tool()], [Message.new_user!("Submit a report")])
+        | max_retry_count: 1
+      }
+
+      {:ok, config} =
+        HumanInTheLoop.init(
+          interrupt_on: %{
+            "submit_report" => %{
+              pre_approval: fn _args, _context -> {:error, "Invalid title"} end
+            }
+          }
+        )
+
+      middleware = [%MiddlewareEntry{id: HumanInTheLoop, module: HumanInTheLoop, config: config}]
+
+      stub(ChatAnthropic, :call, fn _model, _messages, _tools ->
+        send(test_pid, :model_called)
+        {:ok, [assistant_with_tool_call("submit_report", %{"title" => "bad"})]}
+      end)
+
+      assert {:error, failed_chain, %LangChainError{type: "exceeded_failure_count"}} =
+               AgentExecution.run(chain, middleware: middleware, max_runs: 5)
+
+      assert failed_chain.current_failure_count == 1
+      assert_received :model_called
+      refute_received :model_called
+    end
+
     test "invalid calls return to the model, corrected calls pause, and approved calls execute once" do
       test_pid = self()
 
@@ -211,6 +243,8 @@ defmodule Sagents.Modes.AgentExecutionTest do
     end
 
     test "edited arguments are checked before execution" do
+      test_pid = self()
+
       agent =
         pre_approval_agent(fn args, _context ->
           if args["title"] == "good", do: :ok, else: {:error, "Invalid edited title"}
@@ -224,16 +258,27 @@ defmodule Sagents.Modes.AgentExecutionTest do
       assert {:interrupt, paused, _data} = Sagents.Agent.execute(agent, state)
       decisions = [%{type: :edit, arguments: %{"title" => "bad"}}]
 
+      callbacks = [
+        %{
+          on_tool_execution_failed: fn _chain, call, message ->
+            send(test_pid, {:failed_edit, call, message})
+          end
+        }
+      ]
+
       assert {:ok, resumed} =
                HumanInTheLoop.handle_resume(
                  agent,
                  paused,
                  decisions,
                  hd(agent.middleware).config,
-                 []
+                 callbacks: callbacks
                )
 
       assert [%ToolResult{is_error: true} = result] = List.last(resumed.messages).tool_results
+
+      assert_received {:failed_edit, %ToolCall{call_id: "call_1", arguments: %{"title" => "bad"}},
+                       "Invalid edited title"}
 
       assert LangChain.Message.ContentPart.content_to_string(result.content) =~
                "Invalid edited title"

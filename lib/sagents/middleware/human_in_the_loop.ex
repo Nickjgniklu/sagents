@@ -365,41 +365,67 @@ defmodule Sagents.Middleware.HumanInTheLoop do
 
         case run_pre_approval(tool_config[:pre_approval], call.arguments || %{}, context) do
           :ok -> errors
-          {:error, message} -> Map.put(errors, call.call_id, message)
+          {:error, message} -> Map.put(errors, call.call_id, {message, nil})
+          {:error, message, exception} -> Map.put(errors, call.call_id, {message, exception})
         end
       end)
 
     if map_size(errors) == 0 do
       {:ok, chain}
     else
+      effective_calls = Map.new(checked_calls, &{&1.call_id, &1})
+
       results =
         Enum.map(all_calls, fn call ->
-          message =
+          call = Map.get(effective_calls, call.call_id, call)
+
+          {message, exception} =
             case Map.get(decisions_by_id, call.call_id) do
               %{type: :reject} ->
-                "Tool call rejected by the human reviewer. Do not retry without a new user request."
+                {"Tool call rejected by the human reviewer. Do not retry without a new user request.",
+                 nil}
 
               _other ->
                 Map.get(
                   errors,
                   call.call_id,
-                  "Tool call not executed because another call failed pre-approval validation. " <>
-                    "Correct the invalid call and retry this call if it is still needed."
+                  {"Tool call not executed because another call failed pre-approval validation. " <>
+                     "Correct the invalid call and retry this call if it is still needed.", nil}
                 )
             end
 
           Callbacks.fire(chain.callbacks, :on_tool_execution_failed, [chain, call, message])
 
+          case exception do
+            {error, stacktrace} ->
+              Callbacks.fire(chain.callbacks, :on_tool_execution_exception, [
+                chain,
+                call,
+                error,
+                stacktrace
+              ])
+
+            nil ->
+              :ok
+          end
+
           ToolResult.new!(%{
             tool_call_id: call.call_id,
             name: call.name,
             content: message,
-            is_error: true
+            is_error: true,
+            is_exception: not is_nil(exception),
+            exception: exception
           })
         end)
 
       message = Message.new_tool_result!(%{tool_results: results})
-      updated_chain = LLMChain.add_message(chain, message)
+
+      updated_chain =
+        chain
+        |> LLMChain.add_message(message)
+        |> LLMChain.increment_current_failure_count()
+
       Callbacks.fire(chain.callbacks, :on_tool_response_created, [updated_chain, message])
       Callbacks.fire(chain.callbacks, :on_message_processed, [updated_chain, message])
       {:error, updated_chain}
@@ -417,7 +443,9 @@ defmodule Sagents.Middleware.HumanInTheLoop do
       _other -> {:error, "Invalid pre_approval response. The tool call was not executed."}
     end
   rescue
-    _exception -> {:error, "Pre-approval validation failed. The tool call was not executed."}
+    exception ->
+      {:error, "Pre-approval validation failed. The tool call was not executed.",
+       {exception, __STACKTRACE__}}
   end
 
   @doc """
